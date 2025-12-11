@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 import sqlite3
 import argparse
-import sys
-import os
+from db_utils import find_db_file
 
 
 def analyze_long_tasks(db_path: str, limit: int = 3):
@@ -105,15 +104,7 @@ def main():
     parser.add_argument('--limit', type=int, default=3, help='Number of longest tasks to analyze')
     
     args = parser.parse_args()
-    
-    chats_db = args.db_file
-    if chats_db == 'EXAMPLE.db' and not os.path.exists(chats_db):
-        import glob
-        db_files = glob.glob('*.db')
-        if db_files:
-            chats_db = max(db_files, key=os.path.getmtime)
-            print(f"EXAMPLE.db not found, using most recent database: {chats_db}")
-    
+    chats_db = find_db_file(args.db_file if args.db_file != 'EXAMPLE.db' else None)
     analyze_long_tasks(chats_db, args.limit)
 
 

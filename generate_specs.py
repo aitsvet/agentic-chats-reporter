@@ -3,12 +3,11 @@ import sqlite3
 import argparse
 import sys
 import os
-import time
 from typing import List, Dict, Tuple
 from datetime import datetime
 from dotenv import load_dotenv
-from openai import OpenAI
-from llm_utils import get_model_context_size, tokens_to_chars
+from llm_utils import get_model_context_size, tokens_to_chars, get_output_reserve_tokens, create_openai_client, load_api_config, DEFAULT_SPEC_PARAMS, get_llm_params, retry_with_backoff, clean_llm_response, get_llm_context_limit_and_max_tokens
+from db_utils import find_db_file, add_db_file_argument
 
 
 SPEC_SYSTEM_PROMPT = """Maintain requirements specification by preserving existing requirements and extending with insights from new task group summaries.
@@ -100,17 +99,21 @@ class SpecGenerator:
     def __init__(self, chats_db: str, llm_url: str, llm_model: str, llm_api_key: str = None):
         self.chats_conn = sqlite3.connect(chats_db)
         self.chats_cursor = self.chats_conn.cursor()
-        api_key = llm_api_key or os.getenv('LLM_API_KEY', 'not-needed')
-        self.llm_client = OpenAI(base_url=llm_url, api_key=api_key)
+        self.llm_client = create_openai_client(llm_url, llm_api_key, 'LLM_API_KEY')
         self.llm_model = llm_model
-        self.llm_context_size = self._get_llm_context_size()
+        self.spec_params = get_llm_params('SPEC_PARAMS', DEFAULT_SPEC_PARAMS)
+        self.dedup_params = get_llm_params('DEDUP_PARAMS', DEFAULT_SPEC_PARAMS)
+        self.llm_context_size, self.spec_api_max_tokens = get_llm_context_limit_and_max_tokens(
+            self.llm_client, self.llm_model, self.spec_params
+        )
+        _, self.dedup_api_max_tokens = get_llm_context_limit_and_max_tokens(
+            self.llm_client, self.llm_model, self.dedup_params
+        )
         spec_prompt_base = os.getenv('SPEC_SYSTEM_PROMPT', SPEC_SYSTEM_PROMPT)
         dedup_prompt_base = os.getenv('DEDUP_SYSTEM_PROMPT', DEDUP_SYSTEM_PROMPT)
         prompt_extra = os.getenv('PROMPT_EXTRA', '').strip()
         self.spec_prompt_template = spec_prompt_base.format(PROMPT_EXTRA=prompt_extra)
-        self.dedup_prompt_template = dedup_prompt_base.format(PROMPT_EXTRA=prompt_extra)
-        self.spec_temperature = float(os.getenv('SPEC_TEMPERATURE', '0.3'))
-        self.dedup_temperature = float(os.getenv('DEDUP_TEMPERATURE', '0.3'))
+        self.dedup_prompt_template = dedup_prompt_base.format(PROMPT_EXTRA=prompt_extra)        
         self._create_tables()
     
     def _create_tables(self):
@@ -129,8 +132,6 @@ class SpecGenerator:
         """)
         self.chats_conn.commit()
     
-    def _get_llm_context_size(self) -> int:
-        return get_model_context_size(self.llm_client, self.llm_model, model_type='llm')
     
     def load_specs_from_db(self) -> Tuple[str, set]:
         """Load existing specs and processed group IDs from database."""
@@ -174,18 +175,17 @@ class SpecGenerator:
     
     def get_group_summaries(self) -> List[Dict]:
         summaries = self.chats_cursor.execute("""
-            SELECT group_id, title, user_summary, agent_summary, first_timestamp
+            SELECT group_id, title, summary, first_timestamp
             FROM group_summaries
             ORDER BY first_timestamp ASC
         """).fetchall()
         
         result = []
-        for group_id, title, user_summary, agent_summary, first_timestamp in summaries:
+        for group_id, title, summary, first_timestamp in summaries:
             result.append({
                 'group_id': group_id,
                 'title': title,
-                'user_summary': user_summary or '',
-                'agent_summary': agent_summary or '',
+                'summary': summary or '',
                 'first_timestamp': first_timestamp
             })
         
@@ -196,13 +196,8 @@ class SpecGenerator:
         for summary in summaries:
             parts.append(f"## {summary['title']} ({summary['first_timestamp']})")
             parts.append("")
-            if summary['user_summary']:
-                parts.append("**User:**")
-                parts.append(summary['user_summary'])
-                parts.append("")
-            if summary['agent_summary']:
-                parts.append("**Agent:**")
-                parts.append(summary['agent_summary'])
+            if summary['summary']:
+                parts.append(summary['summary'])
                 parts.append("")
             parts.append("---")
             parts.append("")
@@ -280,10 +275,9 @@ class SpecGenerator:
         return '\n'.join(result_parts).strip()
     
     def generate_specs_from_summaries(self, summaries: List[Dict], existing_specs: str = "", processed_group_ids: set = None, save_after_batch: bool = True) -> str:
-        context_size_chars = tokens_to_chars(self.llm_context_size)
-        max_batch_size = int(context_size_chars * 0.5)
-        max_specs_size = int(context_size_chars * 0.25)
-        output_reserve = int(context_size_chars * 0.25)
+        overall_limit_chars = tokens_to_chars(self.llm_context_size)
+        max_batch_size = int(overall_limit_chars * 0.5)
+        max_specs_size = int(overall_limit_chars * 0.25)
         current_specs = existing_specs
         processed_group_ids = processed_group_ids or set()
         
@@ -308,7 +302,7 @@ class SpecGenerator:
             
             prompt_overhead = len(self.spec_prompt_template) + 200
             user_content_prefix = len(f"Existing specs:\n\n\n\n---\n\nNew task group summaries to analyze:\n\n")
-            available_for_batch = context_size_chars - current_specs_size - prompt_overhead - user_content_prefix - output_reserve
+            available_for_batch = overall_limit_chars - current_specs_size - prompt_overhead - user_content_prefix
             actual_batch_size = min(max_batch_size, available_for_batch)
             
             if actual_batch_size <= 0:
@@ -348,135 +342,133 @@ class SpecGenerator:
             print(f"  Processing batch: summaries {batch_start_idx}-{idx} ({len(batch_summaries)} summaries)...")
             sys.stdout.flush()
             
-            if os.getenv('DEBUG_LLM') == '1':
-                print(f"\n{'='*80}")
-                print(f"LLM Request (batch {idx - len(batch_summaries) + 1}-{idx}):")
-                print(f"{'='*80}")
-                print(f"\n[SYSTEM PROMPT]\n{self.spec_prompt_template}")
-                print(f"\n{'='*80}")
-                print(f"[USER CONTENT] ({len(user_content)} characters)\n{user_content[:500]}...")
-                print(f"{'='*80}\n")
-                sys.stdout.flush()
-            
-            max_retries = int(os.getenv('LLM_MAX_RETRIES', '3'))
-            base_delay = float(os.getenv('LLM_RETRY_DELAY', '1.0'))
-            success = False
-            
-            for attempt in range(max_retries):
-                if attempt > 0:
-                    print(f"    Retrying LLM API call (attempt {attempt + 1}/{max_retries})...")
-                else:
-                    print(f"    Calling LLM API (attempt {attempt + 1}/{max_retries})...")
-                sys.stdout.flush()
-                try:
-                    response = self.llm_client.chat.completions.create(
-                        model=self.llm_model,
-                        messages=[
-                            {"role": "system", "content": self.spec_prompt_template},
-                            {"role": "user", "content": user_content}
-                        ],
-                        temperature=self.spec_temperature
-                    )
-                    
-                    response_text = response.choices[0].message.content.strip()
-                    
-                    if os.getenv('DEBUG_LLM') == '1':
-                        print(f"\n{'='*80}")
-                        print(f"LLM Response:")
-                        print(f"{'='*80}")
-                        print(f"\n{response_text}")
-                        print(f"{'='*80}\n")
-                        sys.stdout.flush()
-                    
-                    current_specs = response_text
-                    success = True
-                    
-                    batch_group_ids = [s['group_id'] for s in batch_summaries]
-                    self.mark_summaries_processed(batch_group_ids)
-                    
-                    if save_after_batch:
-                        self.save_specs_to_db(current_specs)
-                    
-                    print(f"  Processed {idx}/{len(summaries)} summaries")
-                    sys.stdout.flush()
-                    break
-                    
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        print(f"    LLM API error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {delay:.1f}s...")
-                        sys.stdout.flush()
-                        time.sleep(delay)
-                    else:
-                        print(f"    Error generating specs after {max_retries} attempts: {e}")
-                        break
-            
-            if not success:
-                break
-        
-        return current_specs
-    
-    def deduplicate_specs(self, specs: str) -> str:
-        max_retries = int(os.getenv('LLM_MAX_RETRIES', '3'))
-        base_delay = float(os.getenv('LLM_RETRY_DELAY', '1.0'))
-        
-        print(f"    Calling LLM for deduplication ({len(specs):,} chars)...")
-        sys.stdout.flush()
-        
-        for attempt in range(max_retries):
-            try:
+            @retry_with_backoff(retry_env_prefix='LLM')
+            def _call_spec_api():
                 if os.getenv('DEBUG_LLM') == '1':
                     print(f"\n{'='*80}")
-                    print(f"LLM Deduplication Request:")
+                    print(f"LLM Request (batch {idx - len(batch_summaries) + 1}-{idx}):")
                     print(f"{'='*80}")
-                    print(f"\n[SYSTEM PROMPT]\n{self.dedup_prompt_template}")
+                    print(f"\n[SYSTEM PROMPT]\n{self.spec_prompt_template}")
                     print(f"\n{'='*80}")
-                    print(f"[SPECS TO DEDUP] ({len(specs)} characters)\n{specs[:500]}...")
+                    print(f"[USER CONTENT] ({len(user_content)} characters)\n{user_content[:500]}...")
                     print(f"{'='*80}\n")
                     sys.stdout.flush()
                 
-                response = self.llm_client.chat.completions.create(
-                    model=self.llm_model,
-                    messages=[
-                        {"role": "system", "content": self.dedup_prompt_template},
-                        {"role": "user", "content": specs}
-                    ],
-                    temperature=self.dedup_temperature
-                )
+                api_params = {
+                    'model': self.llm_model,
+                    'messages': [
+                        {"role": "system", "content": self.spec_prompt_template},
+                        {"role": "user", "content": user_content}
+                    ]
+                }
+                for key, value in self.spec_params.items():
+                    if value is not None and key != 'max_tokens':
+                        api_params[key] = value
+                
+                if self.spec_api_max_tokens is not None:
+                    api_params['max_tokens'] = self.spec_api_max_tokens
+                
+                response = self.llm_client.chat.completions.create(**api_params)
                 
                 response_text = response.choices[0].message.content.strip()
+                response_text = clean_llm_response(response_text)
                 
                 if os.getenv('DEBUG_LLM') == '1':
                     print(f"\n{'='*80}")
-                    print(f"LLM Deduplication Response:")
+                    print(f"LLM Response:")
                     print(f"{'='*80}")
                     print(f"\n{response_text}")
                     print(f"{'='*80}\n")
                     sys.stdout.flush()
                 
                 return response_text
+            
+            try:
+                current_specs = _call_spec_api()
                 
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)
-                    if os.getenv('DEBUG_LLM') == '1':
-                        print(f"    LLM API error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {delay:.1f}s...")
-                        sys.stdout.flush()
-                    time.sleep(delay)
-                else:
-                    print(f"    Error deduplicating specs after {max_retries} attempts: {e}")
-                    return specs
+                batch_group_ids = [s['group_id'] for s in batch_summaries]
+                self.mark_summaries_processed(batch_group_ids)
+                
+                if save_after_batch:
+                    self.save_specs_to_db(current_specs)
+                
+                print(f"  Processed {idx}/{len(summaries)} summaries")
+                sys.stdout.flush()
+            except RuntimeError as e:
+                print(f"    Error generating specs: {e}")
+                break
         
-        return specs
+        return current_specs
+    
+    def deduplicate_specs(self, specs: str) -> str:
+        print(f"    Calling LLM for deduplication ({len(specs):,} chars)...")
+        sys.stdout.flush()
+        
+        @retry_with_backoff(retry_env_prefix='LLM')
+        def _call_dedup_api():
+            if os.getenv('DEBUG_LLM') == '1':
+                print(f"\n{'='*80}")
+                print(f"LLM Deduplication Request:")
+                print(f"{'='*80}")
+                print(f"\n[SYSTEM PROMPT]\n{self.dedup_prompt_template}")
+                print(f"\n{'='*80}")
+                print(f"[SPECS TO DEDUP] ({len(specs)} characters)\n{specs[:500]}...")
+                print(f"{'='*80}\n")
+                sys.stdout.flush()
+            
+            api_params = {
+                'model': self.llm_model,
+                'messages': [
+                    {"role": "system", "content": self.dedup_prompt_template},
+                    {"role": "user", "content": specs}
+                ]
+            }
+            for key, value in self.dedup_params.items():
+                if value is not None and key != 'max_tokens':
+                    api_params[key] = value
+            
+            if self.dedup_api_max_tokens is not None:
+                api_params['max_tokens'] = self.dedup_api_max_tokens
+            
+            response = self.llm_client.chat.completions.create(**api_params)
+            
+            response_text = response.choices[0].message.content.strip()
+            response_text = clean_llm_response(response_text)
+            
+            if os.getenv('DEBUG_LLM') == '1':
+                print(f"\n{'='*80}")
+                print(f"LLM Deduplication Response:")
+                print(f"{'='*80}")
+                print(f"\n{response_text}")
+                print(f"{'='*80}\n")
+                sys.stdout.flush()
+            
+            return response_text
+        
+        try:
+            return _call_dedup_api()
+        except RuntimeError as e:
+            print(f"    Error deduplicating specs: {e}")
+            return specs
     
     def generate_all_specs(self, force: bool = False, final_dedup: bool = True) -> str:
         summaries = self.get_group_summaries()
+        max_tokens = self.spec_params.get('max_tokens')
+        if max_tokens is not None and max_tokens > 0:
+            output_reserve_tokens = int(max_tokens * 0.25)
+            output_reserve_desc = f"{output_reserve_tokens:,} tokens (25% of max_tokens)"
+        else:
+            full_context_size = get_model_context_size(self.llm_client, self.llm_model, model_type='llm')
+            output_reserve_tokens = get_output_reserve_tokens(full_context_size, None)
+            output_reserve_desc = f"{output_reserve_tokens:,} tokens (25% of context)"
+        
         context_size_chars = tokens_to_chars(self.llm_context_size)
+        output_reserve_chars = tokens_to_chars(output_reserve_tokens)
         print(f"Found {len(summaries)} group summaries")
         print(f"LLM context size: {self.llm_context_size:,} tokens ({context_size_chars:,} characters)")
         print(f"Batch size limit: {int(context_size_chars * 0.5):,} characters (50% of context for summaries)")
         print(f"Specs size limit: {int(context_size_chars * 0.25):,} characters (25% of context for collected requirements)")
-        print(f"Output reserve: {int(context_size_chars * 0.25):,} characters (25% of context for LLM output)")
+        print(f"Output reserve: {output_reserve_chars:,} characters ({output_reserve_desc})")
         print()
         
         if not summaries:
@@ -515,30 +507,18 @@ class SpecGenerator:
 def main():
     load_dotenv()
     
-    llm_url = os.getenv('LLM_URL')
-    llm_model = os.getenv('LLM_MODEL')
-    llm_api_key = os.getenv('LLM_API_KEY')
-    
-    if not llm_url or not llm_model:
-        raise ValueError("LLM_URL and LLM_MODEL must be set in environment or .env file")
+    config = load_api_config(['llm_url', 'llm_model'])
     
     parser = argparse.ArgumentParser(description='Generate specifications from group summaries using LLM')
-    parser.add_argument('--db-file', default=None, help='Path to database file (default: searches for *.db files, uses most recent)')
+    add_db_file_argument(parser)
     parser.add_argument('--output', default='specs.md', help='Output markdown file (default: specs.md)')
     parser.add_argument('--force', action='store_true', help='Force re-generation of all specs even if they exist')
     
     args = parser.parse_args()
     
-    chats_db = args.db_file
-    if chats_db is None:
-        import glob
-        db_files = glob.glob('*.db')
-        if not db_files:
-            raise ValueError("No database files found. Please specify --db-file or create a database with parse_chats.py")
-        chats_db = max(db_files, key=os.path.getmtime)
-        print(f"Using most recent database: {chats_db}")
+    chats_db = find_db_file(args.db_file)
     
-    generator = SpecGenerator(chats_db, llm_url, llm_model, llm_api_key)
+    generator = SpecGenerator(chats_db, config['llm_url'], config['llm_model'], config['llm_api_key'])
     try:
         specs = generator.generate_all_specs(force=args.force)
         

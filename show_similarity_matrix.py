@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
 import sqlite3
 import numpy as np
-import sys
 import argparse
-
-
-def decompress_embedding(data: str) -> np.ndarray:
-    import base64
-    import gzip
-    compressed = base64.b64decode(data.encode('ascii'))
-    decompressed = gzip.decompress(compressed)
-    return np.frombuffer(decompressed, dtype=np.float32)
-
-
-def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:
-    dot_product = np.dot(emb1, emb2)
-    norm1 = np.linalg.norm(emb1)
-    norm2 = np.linalg.norm(emb2)
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot_product / (norm1 * norm2)
+from embedding_utils import decompress_embedding, cosine_similarity
+from db_utils import find_db_file, add_db_file_argument
 
 
 def show_similarity_matrix(db_path: str):
@@ -104,10 +88,11 @@ def show_similarity_matrix(db_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description='Show cosine similarity matrix for embeddings')
-    parser.add_argument('--db-file', default='EXAMPLE.db', help='Path to database file')
+    add_db_file_argument(parser)
     
     args = parser.parse_args()
-    show_similarity_matrix(args.db_file)
+    db_file = find_db_file(args.db_file)
+    show_similarity_matrix(db_file)
 
 
 if __name__ == '__main__':

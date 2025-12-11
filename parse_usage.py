@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-import sys
 import sqlite3
 import argparse
 import csv
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from collections import defaultdict
-import os
+from typing import Dict
 
 
 class UsageParser:
@@ -77,10 +74,12 @@ class UsageParser:
                 if existing:
                     skipped_count += 1
                     continue
-                
+                kind = row.get('Kind', '').strip('"')
+                if 'Error' in kind:
+                    continue
                 rows.append((
                     date_str,
-                    row.get('Kind', '').strip('"'),
+                    kind,
                     row.get('Model', '').strip('"'),
                     row.get('Max Mode', '').strip('"'),
                     int(row.get('Input (w/ Cache Write)', '0') or '0'),
@@ -268,10 +267,8 @@ def main():
     
     args = parser.parse_args()
     
-    if args.db_file is None:
-        db_path = os.path.splitext(args.csv_file)[0] + '.db'
-    else:
-        db_path = args.db_file
+    from db_utils import derive_db_path_from_file
+    db_path = derive_db_path_from_file(args.csv_file, args.db_file)
     
     parser_obj = UsageParser(db_path)
     try:

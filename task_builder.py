@@ -2,7 +2,7 @@
 import sqlite3
 import re
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 
 class TaskBuilder:
@@ -410,6 +410,70 @@ class TaskBuilder:
             final.append(summary)
         
         return final
+    
+    def aggressive_deduplicate_summaries(self, summaries: List[str]) -> List[str]:
+        """Apply maximum deduplication to summaries using progressive levels.
+        Used when content exceeds context limits."""
+        if not summaries:
+            return []
+        
+        dedup_level = 1
+        filtered = summaries[:]
+        
+        while dedup_level <= 5:
+            if dedup_level == 1:
+                seen = set()
+                filtered = []
+                for s in summaries:
+                    normalized = self._normalize_summary(s)
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        filtered.append(s)
+            
+            elif dedup_level == 2:
+                seen_window = {}
+                filtered = []
+                for i, s in enumerate(summaries):
+                    normalized = self._normalize_summary(s)
+                    if normalized not in seen_window or i - seen_window[normalized] > 3:
+                        seen_window[normalized] = i
+                        filtered.append(s)
+            
+            elif dedup_level == 3:
+                file_ops = {}
+                filtered = []
+                for s in summaries:
+                    normalized = self._normalize_summary(s)
+                    is_file_op = 'Read file:' in s or 'Edit file:' in s
+                    if is_file_op:
+                        if normalized not in file_ops:
+                            file_ops[normalized] = []
+                        file_ops[normalized].append(s)
+                    else:
+                        filtered.append(s)
+                for normalized, ops in file_ops.items():
+                    if ops:
+                        filtered.append(ops[-1])
+            
+            elif dedup_level == 4:
+                file_ops = {}
+                other = []
+                for s in summaries:
+                    normalized = self._normalize_summary(s)
+                    is_file_op = 'Read file:' in s or 'Edit file:' in s
+                    if is_file_op:
+                        if normalized not in file_ops:
+                            file_ops[normalized] = s
+                    else:
+                        other.append(s)
+                filtered = list(file_ops.values()) + other
+            
+            else:
+                filtered = summaries[:len(summaries)//2] + summaries[-len(summaries)//4:]
+            
+            dedup_level += 1
+        
+        return filtered
     
     def format_task_text(self, user_content: str, agent_summaries: List[str]) -> str:
         parts = [f"User: {user_content}"]

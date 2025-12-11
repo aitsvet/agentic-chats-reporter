@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 import sqlite3
 import argparse
-from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+from typing import List, Dict, Tuple
 import glob
-import os
-from datetime import datetime, timezone
 from task_builder import TaskBuilder
+from db_utils import find_db_file, add_db_file_argument
 
 
 class ChatUsageCorrelator:
@@ -559,19 +557,12 @@ class ChatUsageCorrelator:
 
 def main():
     parser = argparse.ArgumentParser(description='Correlate chat messages with usage API requests')
-    parser.add_argument('--db-file', default=None, help='Path to chats database file (default: searches for *.db files, uses most recent)')
+    add_db_file_argument(parser, "(chats database)")
     parser.add_argument('--usage-db-file', default=None, help='Path/pattern to usage database file(s) (default: uses --db-file if not specified)')
     
     args = parser.parse_args()
     
-    chats_db = args.db_file
-    if chats_db is None:
-        import glob
-        db_files = glob.glob('*.db')
-        if not db_files:
-            raise ValueError("No database files found. Please specify --db-file or create a database with parse_chats.py")
-        chats_db = max(db_files, key=os.path.getmtime)
-        print(f"Using most recent database: {chats_db}")
+    chats_db = find_db_file(args.db_file)
     
     usage_db = args.usage_db_file
     if usage_db is None:

@@ -6,7 +6,7 @@
 - Accept command-line arguments for input file paths with default values (--md-file, --csv-file, --output)
 - Automatically derive output report filename from input markdown filename (<md_file_base>-REPORT.md)
 - Validate input file existence before processing
-- Execute processing steps sequentially: parse chats → parse usage (optional) → correlate → embed → cluster → generate summaries → generate specs
+- Execute processing steps sequentially: parse chats → parse usage (optional) → correlate → embed → cluster → generate summaries → generate specs → generate task sequence (optional)
 - Stream subprocess output to stdout in real-time for progress visibility
 - Filter and capture relevant output sections from each processing step
 - Append filtered output sections to report file in correct order
@@ -44,7 +44,6 @@
 - Truncate agent command summaries to configurable line limit (AGENT_COMMAND_MAX_LINES)
 - Generate statistics table with counts and length metrics
 - Display parsing statistics after completion
-- Support database path specification separate from input file (--db-file argument)
 
 ## Usage CSV Parsing
 
@@ -59,7 +58,6 @@
 - Support multiple time window sizes for TPS analysis
 - Generate unified statistics table with all metrics
 - Display usage statistics in formatted table after parsing
-- Support database path specification separate from input file (--db-file argument)
 
 ## Task Building
 
@@ -109,8 +107,6 @@
 - Format tasks as text with user content and agent summaries
 - Call embedding API to generate vector embeddings for tasks
 - Handle API authentication using configurable API keys
-- Retry failed embedding API calls with exponential backoff
-- Support configurable retry count and delay via environment variables (EMB_MAX_RETRIES, EMB_RETRY_DELAY)
 - Store embeddings in compressed format in database (base64-encoded, gzip-compressed)
 - Reuse existing embeddings when available
 - Update stored task metadata when needed
@@ -118,7 +114,6 @@
 - Apply progressive deduplication when context overflow occurs
 - Use maximum deduplication strategies to fit tasks within limits
 - Track embedding extraction progress with periodic status updates
-- Handle embedding API errors gracefully with retry logic
 - Store task metadata including message count and formatted length
 - Support fetching model context size from API
 - Support environment variable override for embedding model context size (EMB_CONTEXT_LIMIT, in tokens)
@@ -129,14 +124,13 @@
 
 - Load embeddings and task metadata from database
 - Compute pairwise distance matrix for all tasks once and reuse across operations
-- Calculate cosine distances between task embeddings
-- Apply sequence-based penalty to cosine distance to preserve temporal order semantics (CLUSTER_SEQUENCE_WEIGHT)
-- Find optimal clustering threshold using k-distance graph analysis (targets ~85% clustering ratio)
-- Adjust clustering parameters based on dataset size
-- Use Agglomerative Hierarchical Clustering with average linkage for similarity-based grouping
+- Calculate cosine distances between consecutive task embeddings only (O(n) complexity)
+- Find optimal clustering threshold using percentile of consecutive distances (default: 0.85 for 85th percentile, configurable via CLUSTER_THRESHOLD)
+- Support minimum group size ratio to allow merging even when groups would exceed max_size (CLUSTER_MIN_GROUP_SIZE_RATIO)
+- Use Sequential Clustering: merge consecutive tasks if similar (distance <= threshold) and group fits within size limit
 - Ensure 100% task coverage (all tasks assigned to groups)
-- Recursively split clusters that exceed LLM context size limits (80% of model limit)
-- Fetch LLM context size from API or use environment variable override (LLM_CONTEXT_LIMIT, in tokens)
+- Recursively split clusters that exceed LLM context size limits (80% of overall limit)
+- Use `max_tokens` from `SUMMARY_PARAMS` as overall content size limit if provided, apply 0.8 coefficient to it (no API fetch). Otherwise fetch LLM context size from API and apply 0.8 coefficient to it
 - Apply recursive splitting with tighter thresholds when needed
 - Use size-based splitting as fallback when clustering cannot split large groups
 - Prevent infinite recursion with depth limits and minimum thresholds
@@ -155,20 +149,16 @@
 - Format group content with all tasks for LLM processing
 - Call LLM API to generate summaries for each group
 - Handle API authentication using configurable API keys
-- Retry failed LLM API calls with exponential backoff
-- Support configurable retry count and delay via environment variables (LLM_MAX_RETRIES, LLM_RETRY_DELAY)
-- Support configurable temperature via environment variable (SUMMARY_TEMPERATURE)
+- Support configurable OpenAI chat completions API parameters via JSON environment variable (SUMMARY_PARAMS, defaults: temperature=0.1, frequency_penalty=1.3). See OpenAI API documentation for available parameters
 - Generate 5-7 word title for each group
-- Generate user request summary in imperative voice (up to USER_REPORT_MAX_LINES)
-- Generate agent actions summary in past tense (up to AGENT_REPORT_MAX_LINES)
+- Generate user request summary in imperative voice (up to USER_SUMMARY_MAX_TOKENS tokens)
+- Generate agent actions summary in past tense (up to AGENT_SUMMARY_MAX_TOKENS tokens)
 - Include all tasks from group in summaries without omission
-- Enforce maximum line limits for summaries
+- Enforce maximum token limits for summaries via API max_tokens parameter
 - Use configurable system prompt for summarization (SUMMARY_SYSTEM_PROMPT)
 - Support custom prompt via environment variable
-- Support PROMPT_EXTRA for additional instructions appended to all system prompts
 - Parse LLM response to extract title, user, and agent sections
 - Store summaries in group_summaries database table
-- Handle LLM API errors gracefully with retry logic
 - Track summarization progress with periodic updates
 - Order groups by first message timestamp in output
 - Generate numbered table of contents before summaries
@@ -186,7 +176,7 @@
 - Accumulate all requirements from all task groups by merging new requirements into existing specs
 - Merge requirements from each batch response into accumulated specs (not replace)
 - Automatically run deduplication when specs size exceeds 25% of context size
-- Use LLM context size from API or environment variable override (LLM_CONTEXT_LIMIT, in tokens)
+- Use `max_tokens` from `SPEC_PARAMS` and `DEDUP_PARAMS` as overall content size limit if provided (no API fetch). Otherwise use LLM context size from API (automatically detected)
 - Generate technical requirements (what technology the project uses and how)
 - Generate domain requirements (what user value the project delivers and how)
 - Output specs with first-level titled sections (##) for different categories
@@ -198,13 +188,35 @@
 - Support resuming from database (skip already processed summaries)
 - Support --force flag to clear existing specs and reprocess all summaries
 - Support custom prompts via SPEC_SYSTEM_PROMPT and DEDUP_SYSTEM_PROMPT environment variables
-- Support PROMPT_EXTRA for additional instructions appended to all system prompts
-- Support configurable temperatures via environment variables (SPEC_TEMPERATURE, DEDUP_TEMPERATURE)
-- Retry failed LLM API calls with exponential backoff
-- Support configurable retry count and delay via environment variables (LLM_MAX_RETRIES, LLM_RETRY_DELAY)
-- Handle LLM API errors gracefully with retry logic
+- Support configurable OpenAI chat completions API parameters via JSON environment variables (SPEC_PARAMS, DEDUP_PARAMS, defaults: temperature=0.3). See OpenAI API documentation for available parameters
 - Track specification generation progress with periodic updates
 - Output specs before task summaries in final report
+
+## Task Sequence Generation
+
+- Load project specifications and group summaries from database
+- Generate detailed, actionable task sequence for implementing or rewriting project
+- Each task must be 200-500 words with specific implementation details
+- Include file names, function signatures, data structures, API endpoints, database schemas in each task
+- Use decision memory to maintain consistent tech stack and architectural decisions
+- Process summaries in batches that fit within LLM context limits (50% of context for summaries)
+- Account for decision memory size in all context window calculations
+- Generate tasks that build logically upon previous tasks (dependencies first)
+- Unify task sequence to ensure consistent architecture adhering to KISS, DRY, and SOLID principles
+- Design compound architecture: cohesive modules with clear boundaries, well-defined interfaces, logical composition
+- Update decision memory with new architectural decisions during unification
+- Preserve full detail and size of each task during unification (do not compress)
+- Support configurable task generation goal via TASK_GENERATION_EXTRA environment variable
+- Support initial decision memory via INITIAL_DECISION_MEMORY environment variable
+- Enforce decision memory length limit (default: 2500 chars ≈ 500 words, configurable via DECISION_MEMORY_MAX_CHARS)
+- Truncate decision memory with warning if it exceeds limit during extraction
+- Store task sequence and decision memory in database (task_sequences table)
+- Support resuming from database (skip generation if sequence exists, unless --force flag used)
+- Support custom prompts via TASK_GENERATION_SYSTEM_PROMPT and UNIFICATION_SYSTEM_PROMPT environment variables
+- Support configurable OpenAI chat completions API parameters via JSON environment variables (TASK_GENERATION_PARAMS, UNIFY_PARAMS, defaults: temperature=0.3). See OpenAI API documentation for available parameters
+- Handle large task sequences by processing in chunks when needed
+- Track task generation progress with periodic updates
+- Output task sequence with decision memory to markdown file
 
 ## Database Schema
 
@@ -219,6 +231,7 @@
 - Store group summaries in group_summaries table (group_id, title, user_summary, agent_summary, first_timestamp, task_count)
 - Store generated specifications in specs table (id, specs_text, last_updated)
 - Store processed summaries tracking in processed_summaries table (group_id, processed_at)
+- Store task sequences and decision memory in task_sequences table (id, sequence_text, decision_memory, last_updated)
 - Store usage statistics with indexed timestamp field
 - Track line numbers for parsed entities
 - Support querying by chat, message, and task relationships
@@ -262,21 +275,22 @@
 
 - Support environment variables for API endpoints and models (EMB_URL, EMB_MODEL, LLM_URL, LLM_MODEL)
 - Support optional API keys for authentication (EMB_API_KEY, LLM_API_KEY, default: 'not-needed')
-- Support configurable context limits via environment (LLM_CONTEXT_LIMIT, EMB_CONTEXT_LIMIT, in tokens, override API-fetched values)
+- Support configurable context limits via environment (EMB_CONTEXT_LIMIT, LLM_CONTEXT_LIMIT, in tokens, override API-fetched values)
+- LLM context limit logic: If `max_tokens` is set in `SUMMARY_PARAMS`, `SPEC_PARAMS`, or `DEDUP_PARAMS` and is > 0, use it as context limit (overall token limit: input + output) and send it as parameter. If `max_tokens` is set to <= 0, retrieve context length from API, use it as context limit and send it as parameter. If `LLM_CONTEXT_LIMIT` is set, use it as context limit but do not send it as parameter (only send `max_tokens` if specified). If `LLM_CONTEXT_LIMIT` is not set, retrieve context length from API, use it as context limit, but do not send as parameter. Note: When `max_tokens` is passed to the LLM API, it represents the overall token limit (input + output tokens combined), not just the output limit.
 - Support configurable truncation limits via environment (USER_TEXT_MAX_LINES, AGENT_TEXT_MAX_LINES, AGENT_COMMAND_MAX_LINES)
-- Support configurable summary line limits via environment (USER_REPORT_MAX_LINES, AGENT_REPORT_MAX_LINES)
-- Support configurable clustering parameters via environment (CLUSTER_SEQUENCE_WEIGHT, default: 1.0)
+- Support configurable summary token limits via environment (USER_SUMMARY_MAX_TOKENS, AGENT_SUMMARY_MAX_TOKENS)
+- Support configurable clustering parameters via environment (CLUSTER_THRESHOLD, CLUSTER_MIN_GROUP_SIZE_RATIO)
 - Support configurable character to token ratio via environment (CHAR_TOKEN_RATIO, default: 3.6)
 - Support configurable retry parameters via environment (EMB_MAX_RETRIES, EMB_RETRY_DELAY, LLM_MAX_RETRIES, LLM_RETRY_DELAY)
-- Support configurable temperatures via environment (SUMMARY_TEMPERATURE, SPEC_TEMPERATURE, DEDUP_TEMPERATURE, default: 0.3)
-- Support custom LLM prompts via environment variables (SUMMARY_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT, DEDUP_SYSTEM_PROMPT)
+- Support custom LLM prompts via environment variables (SUMMARY_SYSTEM_PROMPT, SPEC_SYSTEM_PROMPT, DEDUP_SYSTEM_PROMPT, TASK_GENERATION_SYSTEM_PROMPT, UNIFICATION_SYSTEM_PROMPT)
 - Support PROMPT_EXTRA for additional instructions appended to all system prompts
+- Support task generation configuration via environment (TASK_GENERATION_EXTRA, INITIAL_DECISION_MEMORY, DECISION_MEMORY_MAX_CHARS)
+- Support configurable OpenAI chat completions API parameters for task generation via JSON environment variables (TASK_GENERATION_PARAMS, UNIFY_PARAMS, defaults: temperature=0.3)
 - Load configuration from .env file
 - Use default values when environment variables not set
 - Support command-line arguments for file paths
-- Use --db-file argument for database path specification (consistent across all scripts)
+- Support database path specification via --db-file argument (consistent across all scripts)
 - Auto-detect database files when not specified (searches for most recent *.db file)
-- Support database path specification separate from input file
 
 ## Utility and Debug Tools
 
@@ -287,9 +301,14 @@
 - Calculate and display cosine similarity matrix for embeddings
 - Show pairwise similarities between all tasks
 - Display task metadata including timestamps and content previews
-- Analyze group continuity (how consecutive tasks are within groups)
-- Calculate gap statistics and continuity ratios for task groups
-- Show most and least consecutive groups with detailed task information
 - Support configurable limits for analysis output
-- Auto-detect database files when not explicitly specified (searches for most recent *.db file)
-- Use --db-file argument for database path specification (consistent across all scripts)
+
+## Code Organization
+
+- Shared utility modules eliminate duplicate logic across scripts
+- `db_utils.py` provides database file finding, connection helpers, and schema migration utilities
+- `llm_utils.py` provides LLM/API client creation, retry logic, context size calculation, and parameter defaults
+- `embedding_utils.py` provides embedding compression/decompression and cosine similarity calculations
+- `common_utils.py` provides general utilities like progress reporting
+- All scripts use consistent database file auto-detection with default error messages
+- Error messages and help text are centralized in utility modules to avoid duplication

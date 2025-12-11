@@ -4,8 +4,8 @@ import re
 import sqlite3
 import argparse
 import os
-from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, List
+from db_utils import safe_add_column
 
 
 class ChatParser:
@@ -44,14 +44,8 @@ class ChatParser:
         
         existing_chats = self.cursor.execute("SELECT COUNT(*) FROM chats").fetchone()[0]
         if existing_chats > 0:
-            try:
-                self.cursor.execute("ALTER TABLE chats ADD COLUMN start_line INTEGER")
-            except:
-                pass
-            try:
-                self.cursor.execute("ALTER TABLE chats ADD COLUMN end_line INTEGER")
-            except:
-                pass
+            safe_add_column(self.cursor, 'chats', 'start_line INTEGER')
+            safe_add_column(self.cursor, 'chats', 'end_line INTEGER')
         
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -73,18 +67,9 @@ class ChatParser:
         
         existing_messages = self.cursor.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         if existing_messages > 0:
-            try:
-                self.cursor.execute("ALTER TABLE messages ADD COLUMN start_line INTEGER")
-            except:
-                pass
-            try:
-                self.cursor.execute("ALTER TABLE messages ADD COLUMN end_line INTEGER")
-            except:
-                pass
-            try:
-                self.cursor.execute("ALTER TABLE messages ADD COLUMN agent_summary TEXT")
-            except:
-                pass
+            safe_add_column(self.cursor, 'messages', 'start_line INTEGER')
+            safe_add_column(self.cursor, 'messages', 'end_line INTEGER')
+            safe_add_column(self.cursor, 'messages', 'agent_summary TEXT')
         
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS content (
@@ -920,7 +905,6 @@ class ChatParser:
 
 
 def main():
-    import os
     parser = argparse.ArgumentParser(description='Parse chat markdown file into SQLite database')
     parser.add_argument('md_file', help='Path to markdown file to parse')
     parser.add_argument('--db-file', default=None, help='SQLite database path (default: same as md_file with .db extension)')
@@ -931,10 +915,8 @@ def main():
     
     args = parser.parse_args()
     
-    if args.db_file is None:
-        db_path = os.path.splitext(args.md_file)[0] + '.db'
-    else:
-        db_path = args.db_file
+    from db_utils import derive_db_path_from_file
+    db_path = derive_db_path_from_file(args.md_file, args.db_file)
     
     parser_obj = ChatParser(db_path, max_lines=args.max_lines, max_chats=args.max_chats, max_messages=args.max_messages, start_chat=args.start_chat)
     try:

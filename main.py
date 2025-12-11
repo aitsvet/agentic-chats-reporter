@@ -44,62 +44,67 @@ def run_command(cmd, output_file=None, stdout_filter=None):
         return ""
 
 
-def filter_parse_chats_output(output):
+def filter_table_output(output, header_line):
+    """Filter output to capture markdown table starting from header line.
+    
+    Args:
+        output: Full output text
+        header_line: Line that marks the start of the table
+    
+    Returns:
+        Filtered output containing only the table
+    """
     lines = output.split('\n')
     result = []
-    in_stats = False
+    in_table = False
     for line in lines:
-        if '| Category | Count | Length | Avg Length |' in line:
-            in_stats = True
-        if in_stats:
+        if header_line in line:
+            in_table = True
+        if in_table:
             if line.strip().startswith('|'):
                 result.append(line)
             elif line.strip() == '':
                 if result:
                     result.append(line)
-                in_stats = False
+                in_table = False
     return '\n'.join(result) + '\n' if result else ''
+
+
+def filter_section_output(output, section_header):
+    """Filter output to capture section from header to end.
+    
+    Args:
+        output: Full output text
+        section_header: Header line that marks the start of the section
+    
+    Returns:
+        Filtered output containing the section
+    """
+    lines = output.split('\n')
+    result = []
+    capture = False
+    for line in lines:
+        if section_header in line:
+            capture = True
+        if capture:
+            result.append(line)
+    return '\n'.join(result) + '\n' if result else ''
+
+
+def filter_parse_chats_output(output):
+    return filter_table_output(output, '| Category | Count | Length | Avg Length |')
 
 
 def filter_parse_usage_output(output):
-    lines = output.split('\n')
-    result = []
-    in_stats = False
-    for line in lines:
-        if '| Metric | Requests |' in line:
-            in_stats = True
-        if in_stats:
-            if line.strip().startswith('|'):
-                result.append(line)
-            elif line.strip() == '':
-                if result:
-                    result.append(line)
-                in_stats = False
-    return '\n'.join(result) + '\n' if result else ''
+    return filter_table_output(output, '| Metric | Requests |')
 
 
 def filter_cluster_output(output):
-    lines = output.split('\n')
-    result = []
-    capture = False
-    for line in lines:
-        if '## Task Clustering Report' in line:
-            capture = True
-        if capture:
-            result.append(line)
-    return '\n'.join(result) + '\n' if result else ''
+    return filter_section_output(output, '## Task Clustering Report')
 
 
 def filter_correlation_output(output):
-    lines = output.split('\n')
-    result = []
-    capture = False
-    for line in lines:
-        if '## Chat-Usage Correlation Report' in line:
-            capture = True
-        if capture:
-            result.append(line)
-    return '\n'.join(result) + '\n' if result else ''
+    return filter_section_output(output, '## Chat-Usage Correlation Report')
 
 
 def main():

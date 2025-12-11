@@ -1,383 +1,209 @@
 #!/usr/bin/env python3
-import sqlite3
 import argparse
 import sys
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 from embed_tasks import TaskEmbedder
-from openai import OpenAI
 from dotenv import load_dotenv
 import os
-from collections import defaultdict
-from llm_utils import get_model_context_size, tokens_to_chars
+from llm_utils import tokens_to_chars, create_openai_client, load_api_config, DEFAULT_SUMMARY_PARAMS, get_llm_params, get_llm_context_limit_and_max_tokens
+from embedding_utils import decompress_embedding, cosine_distance
+from db_utils import find_db_file, add_db_file_argument
 
 
 class TaskClusterer:
-    def __init__(self, chats_db: str, emb_url: str, emb_model: str, llm_url: str, llm_model: str, emb_api_key: str = None, llm_api_key: str = None, sequence_weight: float = None):
+    def __init__(self, chats_db: str, emb_url: str, emb_model: str, llm_url: str, llm_model: str, emb_api_key: str = None, llm_api_key: str = None):
         self.embedder = TaskEmbedder(chats_db, emb_url, emb_model, emb_api_key)
         self.chats_conn = self.embedder.chats_conn
         self.chats_cursor = self.embedder.chats_cursor
-        api_key = llm_api_key or os.getenv('LLM_API_KEY', 'not-needed')
-        self.llm_client = OpenAI(base_url=llm_url, api_key=api_key)
+        self.llm_client = create_openai_client(llm_url, llm_api_key, 'LLM_API_KEY')
         self.llm_model = llm_model
-        self.llm_context_size = self._get_llm_context_size()
-        self.sequence_weight = sequence_weight if sequence_weight is not None else float(os.getenv('CLUSTER_SEQUENCE_WEIGHT', '1.0'))
+        summary_params = get_llm_params('SUMMARY_PARAMS', DEFAULT_SUMMARY_PARAMS)
+        context_limit, _ = get_llm_context_limit_and_max_tokens(self.llm_client, self.llm_model, summary_params)
+        self.llm_context_size = int(context_limit * 0.8)
+        self.prompt_overhead = self._calculate_prompt_overhead()
+        
+        percentile = os.getenv('CLUSTER_THRESHOLD')
+        self.percentile = float(percentile) if percentile else 0.85
+        
+        min_size_ratio = os.getenv('CLUSTER_MIN_GROUP_SIZE_RATIO')
+        self.min_size_ratio = float(min_size_ratio) if min_size_ratio else None
     
-    def _get_llm_context_size(self) -> int:
-        context_size = get_model_context_size(self.llm_client, self.llm_model, model_type='llm')
-        return int(context_size * 0.8)
+    def _calculate_prompt_overhead(self) -> int:
+        from generate_group_summaries import SUMMARY_SYSTEM_PROMPT
+        summary_prompt_template = os.getenv('SUMMARY_SYSTEM_PROMPT', SUMMARY_SYSTEM_PROMPT)
+        prompt_extra = os.getenv('PROMPT_EXTRA', '').strip()
+        formatted_prompt = summary_prompt_template.format(
+            USER_SUMMARY_MAX_TOKENS=int(os.getenv('USER_SUMMARY_MAX_TOKENS', '480')),
+            AGENT_SUMMARY_MAX_TOKENS=int(os.getenv('AGENT_SUMMARY_MAX_TOKENS', '320')),
+            PROMPT_EXTRA=prompt_extra
+        )
+        return len(formatted_prompt) + 1000
     
-    def cosine_distance(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
-        """Calculate cosine distance (1 - cosine_similarity)."""
-        return 1.0 - self.embedder.cosine_similarity(emb1, emb2)
-    
-    def decompress_embedding(self, data: str) -> np.ndarray:
-        return self.embedder.decompress_embedding(data)
-    
-    def load_embeddings_and_lengths(self, user_msg_ids: Optional[List[int]] = None) -> Tuple[Dict[int, np.ndarray], Dict[int, int], List[int]]:
-        """Load embeddings and formatted lengths for tasks."""
-        if user_msg_ids is None:
-            tasks_data = self.chats_cursor.execute("""
-                SELECT se.user_msg_id, se.embedding_data, se.formatted_length
-                FROM task_embeddings se
-                JOIN messages m ON se.user_msg_id = m.id
-                ORDER BY m.message_datetime, m.start_line
-            """).fetchall()
-        else:
-            placeholders = ','.join('?' * len(user_msg_ids))
-            tasks_data = self.chats_cursor.execute(f"""
-                SELECT se.user_msg_id, se.embedding_data, se.formatted_length
-                FROM task_embeddings se
-                JOIN messages m ON se.user_msg_id = m.id
-                WHERE se.user_msg_id IN ({placeholders})
-                ORDER BY m.message_datetime, m.start_line
-            """, user_msg_ids).fetchall()
+    def load_embeddings_and_lengths(self) -> Tuple[Dict[int, np.ndarray], Dict[int, int], List[int], List[Dict]]:
+        """Load embeddings, lengths, and task data ordered by timestamp."""
+        tasks_data = self.chats_cursor.execute("""
+            SELECT se.user_msg_id, se.embedding_data, se.formatted_length,
+                   m.message_datetime, m.start_line
+            FROM task_embeddings se
+            JOIN messages m ON se.user_msg_id = m.id
+            ORDER BY m.message_datetime, m.start_line
+        """).fetchall()
         
         if not tasks_data:
-            return {}, {}, []
+            return {}, {}, [], []
         
         embeddings_map = {}
         lengths_map = {}
         ordered_user_msg_ids = []
-        for user_msg_id, embedding_data, formatted_length in tasks_data:
-            embedding = self.decompress_embedding(embedding_data)
+        tasks = []
+        
+        for user_msg_id, embedding_data, formatted_length, msg_datetime, start_line in tasks_data:
+            embedding = decompress_embedding(embedding_data)
             embeddings_map[user_msg_id] = embedding
             lengths_map[user_msg_id] = formatted_length or 0
             ordered_user_msg_ids.append(user_msg_id)
+            tasks.append({
+                'user_msg_id': user_msg_id,
+                'formatted_length': formatted_length or 0,
+                'message_datetime': msg_datetime,
+                'start_line': start_line
+            })
         
-        return embeddings_map, lengths_map, ordered_user_msg_ids
+        return embeddings_map, lengths_map, ordered_user_msg_ids, tasks
     
-    def calculate_cluster_size(self, cluster_ids: List[int], lengths_map: Dict[int, int]) -> int:
-        """Calculate total character size of a cluster."""
-        return sum(lengths_map.get(task_id, 0) for task_id in cluster_ids)
+    def calculate_consecutive_distances(self, embeddings_map: Dict[int, np.ndarray], task_ids: List[int]) -> List[float]:
+        """Calculate distances between consecutive tasks only (O(n))."""
+        distances = []
+        
+        for i in range(len(task_ids) - 1):
+            task_id_1 = task_ids[i]
+            task_id_2 = task_ids[i + 1]
+            
+            emb1 = embeddings_map[task_id_1]
+            emb2 = embeddings_map[task_id_2]
+            
+            dist = cosine_distance(emb1, emb2)
+            distances.append(dist)
+        
+        return distances
     
-    def compute_distance_matrix(self, embeddings_map: Dict[int, np.ndarray], task_ids: List[int]) -> np.ndarray:
-        """Compute full pairwise distance matrix with sequence-based penalty."""
-        n = len(task_ids)
-        if n < 2:
-            return np.zeros((n, n))
-        
-        total_pairs = n * (n - 1) // 2
-        print(f"  Computing pairwise distance matrix for {n} tasks ({total_pairs:,} pairs)...")
-        print(f"  Sequence weight: {self.sequence_weight:.3f}")
-        sys.stdout.flush()
-        
-        distance_matrix = np.zeros((n, n))
-        last_progress = 0
-        
-        max_sequence_distance = n - 1
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                cosine_dist = self.cosine_distance(embeddings_map[task_ids[i]], embeddings_map[task_ids[j]])
-                
-                sequence_distance = abs(i - j)
-                normalized_sequence_distance = sequence_distance / max_sequence_distance if max_sequence_distance > 0 else 0
-                
-                adjusted_dist = cosine_dist + self.sequence_weight * normalized_sequence_distance
-                
-                distance_matrix[i, j] = adjusted_dist
-                distance_matrix[j, i] = adjusted_dist
-            
-            progress = int((i + 1) * 100 / n)
-            if progress >= last_progress + 10:
-                pairs_computed = (i + 1) * i // 2 + (i + 1)
-                print(f"  Progress: {progress}% ({pairs_computed:,} pairs computed)")
-                sys.stdout.flush()
-                last_progress = progress
-        
-        print(f"  Completed distance matrix computation")
-        sys.stdout.flush()
-        return distance_matrix
-    
-    def find_optimal_threshold(self, distance_matrix: np.ndarray, task_ids: List[int], 
-                               target_cluster_ratio: float = 0.85) -> float:
-        """Find optimal distance threshold using k-distance graph analysis.
-        
-        Uses the k-distance graph method to find a natural break point in the distance
-        distribution, which typically corresponds to a good clustering threshold.
-        """
-        n = len(task_ids)
-        if n < 2:
-            return 0.5
-        
-        print("  Analyzing distance matrix for optimal threshold using k-distance graph...")
-        sys.stdout.flush()
-        
-        k = min(10, max(3, n // 20))
-        
-        k_distances = []
-        for i in range(n):
-            row_distances = []
-            for j in range(n):
-                if i != j:
-                    row_distances.append(distance_matrix[i, j])
-            row_distances.sort()
-            if len(row_distances) >= k:
-                k_distances.append(row_distances[k - 1])
-            elif row_distances:
-                k_distances.append(row_distances[-1])
-        
-        if not k_distances:
-            all_distances = []
-            for i in range(n):
-                for j in range(i + 1, n):
-                    all_distances.append(distance_matrix[i, j])
-            if not all_distances:
-                return 0.5
-            all_distances.sort()
-            percentile_idx = int(len(all_distances) * 0.2)
-            threshold = all_distances[min(percentile_idx, len(all_distances) - 1)]
-        else:
-            k_distances.sort()
-            
-            percentile_idx = int(len(k_distances) * 0.2)
-            threshold = k_distances[min(percentile_idx, len(k_distances) - 1)]
-            
-            all_distances = []
-            for i in range(n):
-                for j in range(i + 1, n):
-                    all_distances.append(distance_matrix[i, j])
-            all_distances.sort()
-            
-            min_threshold = all_distances[int(len(all_distances) * 0.05)]
-            max_threshold = all_distances[int(len(all_distances) * 0.5)]
-            
-            threshold = max(min_threshold, min(threshold, max_threshold))
-        
-        print(f"  Optimal threshold: {threshold:.4f} (cosine distance)")
-        print(f"  This corresponds to cosine similarity > {1-threshold:.4f}")
-        sys.stdout.flush()
-        
+    def select_threshold(self, distances: List[float]) -> float:
+        """Select threshold using specified percentile of consecutive distances."""
+        sorted_distances = sorted(distances)
+        percentile_idx = int(len(sorted_distances) * self.percentile)
+        threshold = sorted_distances[percentile_idx]
         return threshold
     
-    def agglomerative_cluster(self, task_ids: List[int], distance_matrix: np.ndarray,
-                              task_id_to_index: Dict[int, int], lengths_map: Dict[int, int],
-                              distance_threshold: float, max_cluster_size: int) -> Tuple[Dict[int, List[int]], int]:
-        """Agglomerative hierarchical clustering with distance threshold and size constraints.
+    def sequential_cluster(self, tasks: List[Dict], embeddings_map: Dict[int, np.ndarray], 
+                          threshold: float, max_size: int, min_size: Optional[int] = None) -> List[List[Dict]]:
+        """Sequential clustering: merge consecutive tasks if similar and fits."""
+        groups = []
+        current_group = []
+        current_size = 0
         
-        Ensures all tasks are grouped. Uses average-linkage clustering.
-        Returns (final_groups, initial_cluster_count) where initial_cluster_count is the
-        number of clusters before size-based splitting.
-        """
-        n = len(task_ids)
-        if n == 0:
-            return {}, 0
-        if n == 1:
-            return {0: task_ids}, 1
-        
-        print(f"  Clustering {n} tasks with distance threshold {distance_threshold:.4f}...")
-        sys.stdout.flush()
-        
-        from sklearn.cluster import AgglomerativeClustering
-        
-        indices = [task_id_to_index[task_id] for task_id in task_ids]
-        submatrix = distance_matrix[np.ix_(indices, indices)]
-        
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=distance_threshold,
-            linkage='average',
-            metric='precomputed'
-        )
-        
-        labels = clustering.fit_predict(submatrix)
-        
-        groups = defaultdict(list)
-        for i, task_id in enumerate(task_ids):
-            groups[labels[i]].append(task_id)
-        
-        initial_cluster_count = len(groups)
-        print(f"  Initial agglomerative clustering produced {initial_cluster_count} clusters")
-        sys.stdout.flush()
-        
-        final_groups = {}
-        next_group_id = 0
-        
-        for cluster_id, cluster_tasks in groups.items():
-            cluster_size = self.calculate_cluster_size(cluster_tasks, lengths_map)
+        for task in tasks:
+            task_id = task['user_msg_id']
+            task_size = task['formatted_length']
             
-            if cluster_size <= max_cluster_size:
-                final_groups[next_group_id] = cluster_tasks
-                next_group_id += 1
+            can_merge = False
+            
+            if not current_group:
+                can_merge = True
             else:
-                print(f"    Cluster {cluster_id} too large ({cluster_size:,} chars > {max_cluster_size:,} limit), splitting...")
-                sub_groups = self.split_cluster(cluster_tasks, distance_matrix, task_id_to_index, 
-                                               lengths_map, max_cluster_size)
-                for sub_tasks in sub_groups:
-                    final_groups[next_group_id] = sub_tasks
-                    next_group_id += 1
-        
-        return final_groups, initial_cluster_count
-    
-    def split_cluster(self, cluster_tasks: List[int], distance_matrix: np.ndarray,
-                     task_id_to_index: Dict[int, int], lengths_map: Dict[int, int],
-                     max_cluster_size: int, depth: int = 0) -> List[List[int]]:
-        """Split a cluster that exceeds size limit using size-aware splitting."""
-        if len(cluster_tasks) <= 1:
-            return [cluster_tasks]
-        
-        cluster_size = self.calculate_cluster_size(cluster_tasks, lengths_map)
-        if cluster_size <= max_cluster_size:
-            return [cluster_tasks]
-        
-        indent = "      " + "  " * depth
-        print(f"{indent}Splitting cluster of {len(cluster_tasks)} tasks (size: {cluster_size:,} chars, limit: {max_cluster_size:,})...")
-        sys.stdout.flush()
-        
-        min_cluster_size = max_cluster_size * 0.5
-        estimated_clusters = max(2, int(cluster_size / min_cluster_size) + 1)
-        estimated_clusters = min(estimated_clusters, len(cluster_tasks))
-        
-        indices = [task_id_to_index[task_id] for task_id in cluster_tasks]
-        submatrix = distance_matrix[np.ix_(indices, indices)]
-        
-        from sklearn.cluster import KMeans
-        
-        best_split = None
-        best_max_subsize = float('inf')
-        
-        for n_clusters in range(estimated_clusters, min(estimated_clusters + 3, len(cluster_tasks) + 1)):
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(submatrix)
+                last_task = current_group[-1]
+                last_task_id = last_task['user_msg_id']
+                
+                distance = cosine_distance(
+                    embeddings_map[task_id],
+                    embeddings_map[last_task_id]
+                )
+                
+                if distance <= threshold:
+                    if (current_size + task_size) <= max_size:
+                        can_merge = True
+                    elif min_size and current_size < min_size:
+                        can_merge = True
             
-            sub_groups = defaultdict(list)
-            for i, task_id in enumerate(cluster_tasks):
-                sub_groups[labels[i]].append(task_id)
-            
-            max_subsize = 0
-            for sub_cluster_tasks in sub_groups.values():
-                sub_size = self.calculate_cluster_size(sub_cluster_tasks, lengths_map)
-                max_subsize = max(max_subsize, sub_size)
-            
-            if max_subsize < best_max_subsize:
-                best_max_subsize = max_subsize
-                best_split = dict(sub_groups)
-            
-            if max_subsize <= max_cluster_size:
-                break
-        
-        if best_split is None:
-            best_split = {0: cluster_tasks}
-        
-        result = []
-        for sub_cluster_tasks in best_split.values():
-            sub_size = self.calculate_cluster_size(sub_cluster_tasks, lengths_map)
-            if sub_size > max_cluster_size:
-                result.extend(self.split_cluster(sub_cluster_tasks, distance_matrix, 
-                                               task_id_to_index, lengths_map, max_cluster_size, depth + 1))
+            if can_merge:
+                current_group.append(task)
+                current_size += task_size
             else:
-                result.append(sub_cluster_tasks)
+                if current_group:
+                    groups.append(current_group)
+                current_group = [task]
+                current_size = task_size
         
-        return result
+        if current_group:
+            groups.append(current_group)
+        
+        return groups
     
     def cluster_tasks(self) -> Dict[int, List[int]]:
-        """Main clustering function using iterative agglomerative hierarchical clustering."""
-        print(f"Loading embeddings and task lengths...")
+        """Main clustering function using sequential clustering."""
+        print("Loading embeddings and task lengths...")
         sys.stdout.flush()
-        embeddings_map, lengths_map, all_task_ids = self.load_embeddings_and_lengths()
+        embeddings_map, lengths_map, all_task_ids, tasks = self.load_embeddings_and_lengths()
         
         if not all_task_ids:
             print("No tasks found with embeddings")
             return {}
         
         total_tasks = len(all_task_ids)
+        
+        if total_tasks == 1:
+            print(f"Loaded {total_tasks} task")
+            print("Only one task - creating single group")
+            return {0: [all_task_ids[0]]}
+        
         context_size_chars = tokens_to_chars(self.llm_context_size)
+        max_cluster_size_chars = context_size_chars - self.prompt_overhead
+        min_cluster_size_chars = int(max_cluster_size_chars * self.min_size_ratio) if self.min_size_ratio else None
+        
         print(f"Loaded {total_tasks} tasks")
         print(f"LLM context size limit: {self.llm_context_size:,} tokens ({context_size_chars:,} characters)")
+        print(f"Max cluster size: {max_cluster_size_chars:,} chars (context: {context_size_chars:,} - prompt overhead: {self.prompt_overhead:,})")
+        if min_cluster_size_chars:
+            print(f"Min cluster size: {min_cluster_size_chars:,} chars ({self.min_size_ratio*100:.0f}% of max)")
         print()
         sys.stdout.flush()
         
-        print("Computing distance matrix...")
+        print("Calculating consecutive distances...")
         sys.stdout.flush()
-        distance_matrix = self.compute_distance_matrix(embeddings_map, all_task_ids)
-        
-        task_id_to_index = {task_id: i for i, task_id in enumerate(all_task_ids)}
-        
-        print("\nFinding optimal distance threshold...")
+        distances = self.calculate_consecutive_distances(embeddings_map, all_task_ids)
+        print(f"  Analyzed {len(distances)} consecutive pairs")
         sys.stdout.flush()
-        initial_threshold = self.find_optimal_threshold(distance_matrix, all_task_ids, target_cluster_ratio=0.85)
-        print(f"Initial threshold: {initial_threshold:.4f}")
+        
+        print("\nSelecting threshold...")
+        sys.stdout.flush()
+        threshold = self.select_threshold(distances)
+        
+        print(f"  Percentile: {self.percentile:.2f} (CLUSTER_THRESHOLD)")
+        print(f"  Selected threshold: {threshold:.4f}")
+        
+        distances_array = np.array(distances)
+        below_threshold = np.sum(distances_array <= threshold)
+        above_threshold = len(distances) - below_threshold
+        
+        print(f"  Consecutive pairs below threshold: {below_threshold} ({100*below_threshold/len(distances):.1f}%) - will merge into groups")
+        print(f"  Consecutive pairs above threshold: {above_threshold} ({100*above_threshold/len(distances):.1f}%) - will start new groups")
+        print(f"  Note: Groups continue merging consecutive tasks until threshold exceeded or size limit reached")
+        print(f"  Distance range: {np.min(distances_array):.4f} to {np.max(distances_array):.4f}")
+        print(f"  Distance median: {np.median(distances_array):.4f}")
         print()
         sys.stdout.flush()
         
-        all_distances = []
-        for i in range(len(all_task_ids)):
-            for j in range(i + 1, len(all_task_ids)):
-                all_distances.append(distance_matrix[i, j])
-        all_distances.sort()
+        print("Clustering tasks sequentially...")
+        sys.stdout.flush()
+        groups_list = self.sequential_cluster(tasks, embeddings_map, threshold, max_cluster_size_chars, min_cluster_size_chars)
         
-        threshold = initial_threshold
-        max_iterations = 5
-        iteration = 0
+        final_groups = {}
+        for group_id, group_tasks in enumerate(groups_list):
+            final_groups[group_id] = [t['user_msg_id'] for t in group_tasks]
         
-        while iteration < max_iterations:
-            iteration += 1
-            print(f"Performing agglomerative clustering (iteration {iteration})...")
-            print(f"  Using threshold: {threshold:.4f}")
-            sys.stdout.flush()
-            
-            max_cluster_size_chars = tokens_to_chars(self.llm_context_size)
-            final_groups, initial_cluster_count = self.agglomerative_cluster(
-                all_task_ids, distance_matrix, task_id_to_index, lengths_map,
-                threshold, max_cluster_size_chars
-            )
-            
-            if not final_groups:
-                break
-            
-            if initial_cluster_count <= 3:
-                min_threshold_idx = int(len(all_distances) * 0.05)
-                current_threshold_idx = next((i for i, d in enumerate(all_distances) if d >= threshold), len(all_distances) - 1)
-                
-                if current_threshold_idx > min_threshold_idx:
-                    new_threshold_idx = max(min_threshold_idx, int(current_threshold_idx * 0.7))
-                    threshold = all_distances[new_threshold_idx]
-                    print(f"  Agglomerative clustering produced only {initial_cluster_count} cluster(s), tightening threshold to {threshold:.4f}...")
-                    print()
-                    continue
-                else:
-                    print(f"  Threshold already at minimum, proceeding with splitting...")
-                    break
-            
-            largest_cluster_size = 0
-            largest_cluster_tasks = 0
-            for group_tasks in final_groups.values():
-                cluster_size = self.calculate_cluster_size(group_tasks, lengths_map)
-                if cluster_size > largest_cluster_size:
-                    largest_cluster_size = cluster_size
-                    largest_cluster_tasks = len(group_tasks)
-            
-            total_clusters = len(final_groups)
-            single_cluster_ratio = largest_cluster_tasks / total_tasks if total_tasks > 0 else 0
-            
-            print(f"  Result: {total_clusters} clusters (after splitting), largest has {largest_cluster_tasks} tasks ({single_cluster_ratio*100:.1f}%)")
-            break
+        print(f"Clustering complete: {len(final_groups)} groups")
+        sys.stdout.flush()
         
-        if iteration >= max_iterations:
-            print(f"  Reached max iterations, using current clustering result")
-        
-        print()
         return final_groups
     
     def has_clustering_results(self) -> bool:
@@ -388,15 +214,7 @@ class TaskClusterer:
         return count > 0
     
     def validate_clustering_results(self) -> Tuple[bool, Dict]:
-        """
-        Validate that existing clustering results are still valid.
-        Returns (is_valid, stats_dict) where stats_dict contains:
-        - all_tasks_exist: bool
-        - new_tasks_count: int
-        - missing_tasks_count: int
-        - groups_task_count: int
-        - embeddings_task_count: int
-        """
+        """Validate that existing clustering results are still valid."""
         groups_tasks = set(self.chats_cursor.execute("""
             SELECT DISTINCT user_msg_id FROM task_groups WHERE threshold = -1.0
         """).fetchall())
@@ -488,9 +306,12 @@ class TaskClusterer:
         
         print("\n## Task Clustering Report\n")
         context_size_chars = tokens_to_chars(self.llm_context_size)
+        effective_limit = context_size_chars - self.prompt_overhead
+        print(f"**Clustering Method:** Sequential (consecutive tasks only)")
         print(f"**Total Tasks:** {total_tasks}")
         print(f"**Message Count - Min:** {min_msg}, **Avg:** {avg_msg:.1f}, **Max:** {max_msg}\n")
-        print(f"**LLM Context Size Limit:** {self.llm_context_size:,} tokens ({context_size_chars:,} characters)\n")
+        print(f"**LLM Context Size Limit:** {self.llm_context_size:,} tokens ({context_size_chars:,} characters)")
+        print(f"**Effective Cluster Size Limit:** {effective_limit:,} characters (after {self.prompt_overhead:,} chars prompt overhead)\n")
         
         print("### Clustering Statistics\n")
         print("| Metric | Value |")
@@ -502,6 +323,9 @@ class TaskClusterer:
         print(f"| Min Group Size (chars) | {stats['min_length']:,} |")
         print(f"| Avg Group Size (chars) | {stats['avg_length']:,.0f} |")
         print(f"| Max Group Size (chars) | {stats['max_length']:,} |")
+        if stats['min_length'] > 0:
+            size_ratio = stats['max_length'] / stats['min_length']
+            print(f"| Size Ratio (max/min) | {size_ratio:.1f}x |")
         print()
     
     def cleanup_orphaned_groups(self):
@@ -563,13 +387,35 @@ class TaskClusterer:
         
         stats = self.calculate_group_stats(groups)
         
+        context_size_chars = tokens_to_chars(self.llm_context_size)
+        effective_limit = context_size_chars - self.prompt_overhead
+        
+        oversized_groups = []
+        for group_id, user_msg_ids in groups.items():
+            group_total_length = self.chats_cursor.execute("""
+                SELECT COALESCE(SUM(formatted_length), 0)
+                FROM task_embeddings
+                WHERE user_msg_id IN ({})
+            """.format(','.join('?' * len(user_msg_ids))), user_msg_ids).fetchone()[0]
+            if group_total_length > effective_limit:
+                oversized_groups.append((group_id, len(user_msg_ids), group_total_length))
+        
+        if oversized_groups:
+            print(f"\nWARNING: {len(oversized_groups)} group(s) exceed the effective limit ({effective_limit:,} chars):")
+            for group_id, task_count, group_size in sorted(oversized_groups, key=lambda x: x[2], reverse=True)[:5]:
+                print(f"  Group {group_id}: {task_count} tasks, {group_size:,} chars (exceeds by {group_size - effective_limit:,} chars)")
+            if len(oversized_groups) > 5:
+                print(f"  ... and {len(oversized_groups) - 5} more oversized groups")
+            print(f"  These groups may fail during summarization. Consider re-running with --force to regenerate.")
+            sys.stdout.flush()
+        
         print(f"\nStoring {len(groups)} final groups in database...")
         sys.stdout.flush()
         self.store_groups(groups)
         
         total_tasks = sum(len(g) for g in groups.values())
         
-        embeddings_map, lengths_map, all_task_ids = self.load_embeddings_and_lengths()
+        embeddings_map, lengths_map, all_task_ids, tasks = self.load_embeddings_and_lengths()
         expected_count = len(all_task_ids)
         
         if total_tasks != expected_count:
@@ -582,6 +428,11 @@ class TaskClusterer:
         print(f"\nCompleted: {len(groups)} groups, {total_tasks} tasks")
         print(f"Group sizes - Min: {stats['min_tasks']}, Avg: {stats['avg_tasks']:.1f}, Max: {stats['max_tasks']}")
         print(f"Group summary lengths - Min: {stats['min_length']:,.0f}, Avg: {stats['avg_length']:,.0f}, Max: {stats['max_length']:,.0f}")
+        if stats['min_length'] > 0:
+            size_ratio = stats['max_length'] / stats['min_length']
+            print(f"Size ratio (max/min): {size_ratio:.1f}x")
+        if oversized_groups:
+            print(f"Effective limit: {effective_limit:,} chars (after {self.prompt_overhead:,} chars prompt overhead)")
         sys.stdout.flush()
         
         self.generate_report(groups)
@@ -593,36 +444,17 @@ class TaskClusterer:
 def main():
     load_dotenv()
     
-    emb_url = os.getenv('EMB_URL')
-    emb_model = os.getenv('EMB_MODEL')
-    emb_api_key = os.getenv('EMB_API_KEY')
-    llm_url = os.getenv('LLM_URL')
-    llm_model = os.getenv('LLM_MODEL')
-    llm_api_key = os.getenv('LLM_API_KEY')
+    config = load_api_config(['emb_url', 'emb_model', 'llm_url', 'llm_model'])
     
-    if not emb_url or not emb_model:
-        raise ValueError("EMB_URL and EMB_MODEL must be set in environment or .env file")
-    
-    if not llm_url or not llm_model:
-        raise ValueError("LLM_URL and LLM_MODEL must be set in environment or .env file")
-    
-    parser = argparse.ArgumentParser(description='Cluster tasks by similarity using Agglomerative Hierarchical Clustering')
-    parser.add_argument('--db-file', default=None, help='Path to database file (default: searches for *.db files, uses most recent)')
-    parser.add_argument('--sequence-weight', type=float, default=None, help='Weight for sequence distance penalty (default: from CLUSTER_SEQUENCE_WEIGHT env var or 1.0)')
+    parser = argparse.ArgumentParser(description='Cluster tasks by similarity using Sequential Clustering')
+    add_db_file_argument(parser)
     parser.add_argument('--force', action='store_true', help='Force re-clustering even if results exist')
     
     args = parser.parse_args()
     
-    chats_db = args.db_file
-    if chats_db is None:
-        import glob
-        db_files = glob.glob('*.db')
-        if not db_files:
-            raise ValueError("No database files found. Please specify --db-file or create a database with parse_chats.py")
-        chats_db = max(db_files, key=os.path.getmtime)
-        print(f"Using most recent database: {chats_db}")
+    chats_db = find_db_file(args.db_file)
     
-    clusterer = TaskClusterer(chats_db, emb_url, emb_model, llm_url, llm_model, emb_api_key, llm_api_key, args.sequence_weight)
+    clusterer = TaskClusterer(chats_db, config['emb_url'], config['emb_model'], config['llm_url'], config['llm_model'], config['emb_api_key'], config['llm_api_key'])
     try:
         clusterer.run(skip_if_exists=not args.force)
     finally:
@@ -631,4 +463,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
